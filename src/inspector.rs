@@ -21,9 +21,7 @@ use crate::Local;
 use crate::PinScope;
 use crate::StackTrace;
 use crate::Value;
-use crate::crdtp::RawSerializable;
-use crate::crdtp::Serializable;
-use crate::crdtp::cbor_to_json;
+use crate::crdtp::CppVecU8;
 use crate::isolate::RealIsolate;
 use crate::scope::CallbackScope;
 use crate::support::CxxVTable;
@@ -103,16 +101,18 @@ unsafe extern "C" {
     out_error: *mut *mut StringBuffer,
   ) -> bool;
   // Defined in crdtp_binding.cc (needs generated protocol headers in scope).
-  // Returns a `Serializable*` that the caller owns (delete via
-  // `crdtp__Serializable__DELETE`). Null if no injected script found for
-  // the context, or the value can't be wrapped.
+  // Returns a heap-allocated `std::vector<uint8_t>*` holding the JSON
+  // serialization of the minted `RemoteObject`. Null if no injected script
+  // is registered for `context`, or CBOR→JSON conversion failed. Caller
+  // reads size/copies via `crdtp__vec_u8__*` and frees via
+  // `crdtp__vec_u8__DELETE`.
   fn v8_inspector__V8InspectorSession__wrapObject(
     session: *mut RawV8InspectorSession,
     context: *const Context,
     value: *const Value,
     group: StringView,
     generate_preview: bool,
-  ) -> *mut RawSerializable;
+  ) -> *mut CppVecU8;
   fn v8_inspector__Inspectable__BASE__CONSTRUCT(
     buf: *mut MaybeUninit<RawInspectable>,
   );
@@ -850,7 +850,7 @@ impl V8InspectorSession {
     group: StringView,
     generate_preview: bool,
   ) -> Option<String> {
-    let serializable_ptr = unsafe {
+    let json_vec_ptr = unsafe {
       v8_inspector__V8InspectorSession__wrapObject(
         self.raw.as_ptr(),
         &*context,
@@ -859,9 +859,13 @@ impl V8InspectorSession {
         generate_preview,
       )
     };
-    let serializable = Serializable::from_raw(serializable_ptr)?;
-    let cbor = serializable.to_bytes();
-    let json_bytes = cbor_to_json(&cbor)?;
+    if json_vec_ptr.is_null() {
+      return None;
+    }
+    // SAFETY: v8_inspector__V8InspectorSession__wrapObject returned a
+    // non-null pointer; `take_and_free` copies the bytes and deletes
+    // the C++ allocation.
+    let json_bytes = unsafe { CppVecU8::take_and_free(json_vec_ptr) };
     String::from_utf8(json_bytes).ok()
   }
 

@@ -157,7 +157,26 @@ pub struct UberDispatcher(Opaque);
 struct DispatchResultWrapper(Opaque);
 
 #[repr(C)]
-struct CppVecU8(Opaque);
+pub struct CppVecU8(Opaque);
+
+impl CppVecU8 {
+  /// Copy bytes out and free the C++ allocation. For use with raw
+  /// pointers returned by other crdtp-bound FFI that produce a
+  /// `std::vector<uint8_t>*`.
+  ///
+  /// SAFETY: `ptr` must have been obtained from a matching C++
+  /// `new std::vector<uint8_t>()` and the caller must not use it
+  /// again.
+  pub unsafe fn take_and_free(ptr: *mut CppVecU8) -> Vec<u8> {
+    unsafe {
+      let len = crdtp__vec_u8__size(ptr);
+      let mut result = vec![0u8; len];
+      crdtp__vec_u8__copy(ptr, result.as_mut_ptr());
+      crdtp__vec_u8__DELETE(ptr);
+      result
+    }
+  }
+}
 
 #[repr(C)]
 pub struct RawSerializable(Opaque);

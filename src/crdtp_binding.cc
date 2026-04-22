@@ -380,17 +380,26 @@ void crdtp__UberDispatcher__WireBackend(
                     std::move(dispatcher_ptr));
 }
 
-// V8InspectorSession::wrapObject — mint a RemoteObject for a JS value, return
-// as a Serializable* so the Rust side can reuse crdtp's CBOR → JSON path.
+// V8InspectorSession::wrapObject — mint a RemoteObject for a JS value and
+// return its JSON serialization as a `std::vector<uint8_t>*`. Rust reads
+// out the bytes via the existing `crdtp__vec_u8__size` / `copy` / `DELETE`
+// helpers. Returns nullptr when V8 can't wrap (no injected script for the
+// context, CBOR→JSON failed, etc.).
+//
 // Lives in this file because it needs both the public v8-inspector.h surface
 // (session + Inspectable) AND the generated protocol/Runtime.h (so
-// `unique_ptr<RemoteObject>` has a complete type; static_assert in
-// `default_delete<T>` requires `sizeof(T) > 0`).
+// `unique_ptr<RemoteObject>` has a complete type; `default_delete<T>`
+// static_asserts on `sizeof(T) > 0`).
 //
-// Cast is safe: `protocol::Runtime::API::RemoteObject` publicly inherits from
-// `v8_crdtp::Serializable` (via the Object_h.template generator), single
-// inheritance — same pointer address, `static_cast` legal here.
-Serializable* v8_inspector__V8InspectorSession__wrapObject(
+// Design note: we serialize here instead of handing a `Serializable*` back
+// to Rust because `protocol::Runtime::API::RemoteObject` extends an
+// inspector-protocol-generated `Exported` class (see
+// `third_party/inspector_protocol/templates/Exported_h.template`), NOT
+// `v8_crdtp::Serializable`. The two share an `AppendSerialized` method but
+// are separate inheritance trees — any cast between them is ill-formed.
+// Serializing here avoids having to expose a new Rust-visible trait for
+// `Exported`.
+std::vector<uint8_t>* v8_inspector__V8InspectorSession__wrapObject(
     v8_inspector::V8InspectorSession* self, const v8::Context* context,
     const v8::Value* value, v8_inspector::StringView group,
     bool generate_preview) {
@@ -400,7 +409,15 @@ Serializable* v8_inspector__V8InspectorSession__wrapObject(
   if (!ro) {
     return nullptr;
   }
-  return static_cast<Serializable*>(ro.release());
+  std::vector<uint8_t> cbor;
+  ro->AppendSerialized(&cbor);
+  auto* out = new std::vector<uint8_t>();
+  Status status = json::ConvertCBORToJSON(SpanFrom(cbor), out);
+  if (!status.ok()) {
+    delete out;
+    return nullptr;
+  }
+  return out;
 }
 
 }  // extern "C"

@@ -1,11 +1,17 @@
 // Copyright 2024 the Deno authors. All rights reserved. MIT license.
 
 #include "support.h"
+#include "v8-inspector.h"
 #include "v8/third_party/inspector_protocol/crdtp/cbor.h"
 #include "v8/third_party/inspector_protocol/crdtp/dispatch.h"
 #include "v8/third_party/inspector_protocol/crdtp/frontend_channel.h"
 #include "v8/third_party/inspector_protocol/crdtp/json.h"
 #include "v8/third_party/inspector_protocol/crdtp/parser_handler.h"
+// Needed so the `unique_ptr<protocol::Runtime::API::RemoteObject>` returned by
+// `V8InspectorSession::wrapObject` has a complete type — `std::default_delete`
+// refuses incomplete types via a static_assert. Generated into `$target_gen_dir`
+// at build; `$target_gen_dir/src/inspector` is in the include path per BUILD.gn.
+#include "src/inspector/protocol/Runtime.h"
 
 using namespace support;
 using namespace v8_crdtp;
@@ -372,6 +378,29 @@ void crdtp__UberDispatcher__WireBackend(
   uber->WireBackend(span<uint8_t>(domain_data, domain_len),
                     std::vector<std::pair<span<uint8_t>, span<uint8_t>>>(),
                     std::move(dispatcher_ptr));
+}
+
+// V8InspectorSession::wrapObject — mint a RemoteObject for a JS value, return
+// as a Serializable* so the Rust side can reuse crdtp's CBOR → JSON path.
+// Lives in this file because it needs both the public v8-inspector.h surface
+// (session + Inspectable) AND the generated protocol/Runtime.h (so
+// `unique_ptr<RemoteObject>` has a complete type; static_assert in
+// `default_delete<T>` requires `sizeof(T) > 0`).
+//
+// Cast is safe: `protocol::Runtime::API::RemoteObject` publicly inherits from
+// `v8_crdtp::Serializable` (via the Object_h.template generator), single
+// inheritance — same pointer address, `static_cast` legal here.
+Serializable* v8_inspector__V8InspectorSession__wrapObject(
+    v8_inspector::V8InspectorSession* self, const v8::Context* context,
+    const v8::Value* value, v8_inspector::StringView group,
+    bool generate_preview) {
+  std::unique_ptr<v8_inspector::protocol::Runtime::API::RemoteObject> ro =
+      self->wrapObject(ptr_to_local(context), ptr_to_local(value), group,
+                       generate_preview);
+  if (!ro) {
+    return nullptr;
+  }
+  return static_cast<Serializable*>(ro.release());
 }
 
 }  // extern "C"

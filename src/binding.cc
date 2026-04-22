@@ -3409,6 +3409,81 @@ void v8_inspector__V8InspectorSession__schedulePauseOnNextStatement(
     v8_inspector::StringView detail) {
   self->schedulePauseOnNextStatement(reason, detail);
 }
+
+// Forward to the upstream `bool unwrapObject(error, objectId, value, context,
+// objectGroup)`. `out_value` / `out_context` receive raw pointers (via
+// `local_to_ptr`) so the Rust side can lift them back into `Local<T>`;
+// `out_group` / `out_error` receive released `StringBuffer*` to be owned by
+// the Rust `UniquePtr<StringBuffer>` wrapper. Returns upstream's bool.
+bool v8_inspector__V8InspectorSession__unwrapObject(
+    v8_inspector::V8InspectorSession* self,
+    v8_inspector::StringView object_id, const v8::Value** out_value,
+    const v8::Context** out_context,
+    v8_inspector::StringBuffer** out_group,
+    v8_inspector::StringBuffer** out_error) {
+  std::unique_ptr<v8_inspector::StringBuffer> error;
+  v8::Local<v8::Value> value;
+  v8::Local<v8::Context> context;
+  std::unique_ptr<v8_inspector::StringBuffer> group;
+  bool ok = self->unwrapObject(&error, object_id, &value, &context, &group);
+  if (!ok) {
+    *out_error = error.release();
+    *out_value = nullptr;
+    *out_context = nullptr;
+    *out_group = nullptr;
+    return false;
+  }
+  *out_value = local_to_ptr(value);
+  *out_context = local_to_ptr(context);
+  *out_group = group.release();
+  *out_error = nullptr;
+  return true;
+}
+}  // extern "C"
+
+// `V8InspectorSession::Inspectable` is a nested virtual class with a single
+// pure-virtual `get(context) -> Local<Value>`. Rust binding mirrors the
+// `V8InspectorClient` BASE pattern: a C++ struct derives from the base,
+// overrides `get` + dtor, forwards each to a Rust `extern "C"` glue fn.
+// Ownership: addInspectedObject takes a unique_ptr, so V8 deletes the BASE
+// instance; our virtual dtor fires a DROP callback so Rust reclaims the
+// InspectableHeap behind the raw pointer.
+extern "C" {
+const v8::Value* v8_inspector__Inspectable__BASE__get(
+    v8_inspector::V8InspectorSession::Inspectable* self,
+    const v8::Context* context);
+void v8_inspector__Inspectable__BASE__DROP(
+    v8_inspector::V8InspectorSession::Inspectable* self);
+}  // extern "C"
+
+struct v8_inspector__Inspectable__BASE
+    : public v8_inspector::V8InspectorSession::Inspectable {
+  ~v8_inspector__Inspectable__BASE() override {
+    v8_inspector__Inspectable__BASE__DROP(this);
+  }
+  v8::Local<v8::Value> get(v8::Local<v8::Context> context) override {
+    return ptr_to_local(v8_inspector__Inspectable__BASE__get(
+        this, local_to_ptr(context)));
+  }
+};
+
+extern "C" {
+void v8_inspector__Inspectable__BASE__CONSTRUCT(
+    uninit_t<v8_inspector__Inspectable__BASE>* buf) {
+  construct_in_place<v8_inspector__Inspectable__BASE>(buf);
+}
+
+// Ownership transfer: wrap raw `Inspectable*` in unique_ptr so V8 takes it.
+// The caller (Rust) must not touch the pointer after this returns — V8
+// deletes via virtual dtor when it's done, which routes back to the DROP
+// callback to free the Rust-side heap.
+void v8_inspector__V8InspectorSession__addInspectedObject(
+    v8_inspector::V8InspectorSession* self,
+    v8_inspector::V8InspectorSession::Inspectable* inspectable) {
+  self->addInspectedObject(
+      std::unique_ptr<v8_inspector::V8InspectorSession::Inspectable>(
+          inspectable));
+}
 }  // extern "C"
 
 struct v8_inspector__V8Inspector__Channel__BASE

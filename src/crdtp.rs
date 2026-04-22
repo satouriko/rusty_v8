@@ -160,7 +160,7 @@ struct DispatchResultWrapper(Opaque);
 struct CppVecU8(Opaque);
 
 #[repr(C)]
-struct RawSerializable(Opaque);
+pub struct RawSerializable(Opaque);
 
 #[repr(C)]
 struct RawDomainDispatcher(Opaque);
@@ -170,6 +170,17 @@ pub struct Serializable {
 }
 
 impl Serializable {
+  /// Take ownership of a Serializable allocated by C++ (e.g. `wrapObject`).
+  /// Returns `None` for null. The returned wrapper's `Drop` calls
+  /// `crdtp__Serializable__DELETE` to free the C++ allocation.
+  pub fn from_raw(ptr: *mut RawSerializable) -> Option<Self> {
+    if ptr.is_null() {
+      None
+    } else {
+      Some(Self { ptr })
+    }
+  }
+
   pub fn to_bytes(&self) -> Vec<u8> {
     unsafe {
       let vec = crdtp__vec_u8__new();

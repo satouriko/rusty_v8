@@ -21,6 +21,9 @@ use crate::Local;
 use crate::PinScope;
 use crate::StackTrace;
 use crate::Value;
+use crate::crdtp::RawSerializable;
+use crate::crdtp::Serializable;
+use crate::crdtp::cbor_to_json;
 use crate::isolate::RealIsolate;
 use crate::scope::CallbackScope;
 use crate::support::CxxVTable;
@@ -91,6 +94,32 @@ unsafe extern "C" {
   fn v8_inspector__V8InspectorSession__canDispatchMethod(
     method: StringView,
   ) -> bool;
+  fn v8_inspector__V8InspectorSession__unwrapObject(
+    session: *mut RawV8InspectorSession,
+    object_id: StringView,
+    out_value: *mut *const Value,
+    out_context: *mut *const Context,
+    out_group: *mut *mut StringBuffer,
+    out_error: *mut *mut StringBuffer,
+  ) -> bool;
+  // Defined in crdtp_binding.cc (needs generated protocol headers in scope).
+  // Returns a `Serializable*` that the caller owns (delete via
+  // `crdtp__Serializable__DELETE`). Null if no injected script found for
+  // the context, or the value can't be wrapped.
+  fn v8_inspector__V8InspectorSession__wrapObject(
+    session: *mut RawV8InspectorSession,
+    context: *const Context,
+    value: *const Value,
+    group: StringView,
+    generate_preview: bool,
+  ) -> *mut RawSerializable;
+  fn v8_inspector__Inspectable__BASE__CONSTRUCT(
+    buf: *mut MaybeUninit<RawInspectable>,
+  );
+  fn v8_inspector__V8InspectorSession__addInspectedObject(
+    session: *mut RawV8InspectorSession,
+    inspectable: *mut RawInspectable,
+  );
 
   fn v8_inspector__StringBuffer__DELETE(this: *mut StringBuffer);
   fn v8_inspector__StringBuffer__string(this: &StringBuffer) -> StringView<'_>;
@@ -323,6 +352,107 @@ unsafe extern "C" fn v8_inspector__V8InspectorClient__BASE__descriptionForValueS
       .and_then(|mut v| v.take())
       .map(|r| r.into_raw())
       .unwrap_or(std::ptr::null_mut())
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Inspectable — `V8InspectorSession::addInspectedObject` counterpart.
+//
+// Ownership model: Rust constructs an `Inspectable` wrapping a user impl of
+// `InspectableImpl`. Passing it to `V8InspectorSession::add_inspected_object`
+// transfers ownership to V8 via a `unique_ptr`. When V8 later destroys it
+// (e.g. session shutdown or addInspectedObject overflow), our C++ BASE
+// virtual dtor routes back to `v8_inspector__Inspectable__BASE__DROP` here,
+// which reconstructs the `Box<InspectableHeap>` and drops it.
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct RawInspectable {
+  _cxx_vtable: CxxVTable,
+}
+
+#[repr(C)]
+struct InspectableHeap {
+  raw: UnsafeCell<RawInspectable>,
+  imp: Box<dyn InspectableImpl>,
+  _pinned: PhantomPinned,
+}
+
+impl InspectableHeap {
+  unsafe fn from_raw<'b>(this: *const RawInspectable) -> &'b InspectableHeap {
+    unsafe { &(*this.cast::<InspectableHeap>()) }
+  }
+}
+
+/// Embedder trait — implement for objects that need to be exposed as `$0`
+/// (or similar) in the inspector's command-line API via
+/// `V8InspectorSession::add_inspected_object`.
+///
+/// `get` is called lazily by V8 each time the inspected object is accessed
+/// (e.g. the user types `$0` in Console). Return the value freshly for each
+/// call — typically by dereffing a `Global<Value>`.
+pub trait InspectableImpl {
+  fn get<'s>(
+    &self,
+    scope: &mut PinScope<'s, '_>,
+    context: Local<'s, Context>,
+  ) -> Local<'s, Value>;
+}
+
+/// Wraps a `dyn InspectableImpl` in a C++-owned heap suitable for passing
+/// to `V8InspectorSession::add_inspected_object`. The heap is pinned for
+/// the C++ vtable's address-identity requirement; no `Drop` impl on this
+/// type because ownership is ALWAYS transferred to C++ via
+/// `add_inspected_object` (the C++ dtor fires `__DROP` back to reclaim).
+pub struct Inspectable {
+  heap: *mut InspectableHeap,
+}
+
+impl Inspectable {
+  pub fn new(imp: Box<dyn InspectableImpl>) -> Self {
+    let heap = unsafe {
+      let h = Box::into_raw(Box::new(MaybeUninit::<InspectableHeap>::uninit()))
+        .cast::<InspectableHeap>();
+      let raw = &raw mut (*h).raw;
+      v8_inspector__Inspectable__BASE__CONSTRUCT(raw.cast());
+      let imp_ptr = &raw mut (*h).imp;
+      imp_ptr.write(imp);
+      // Zero the `_pinned` marker — `MaybeUninit::uninit` leaves it
+      // undefined, but it's a ZST so reads are meaningless either way;
+      // we still write-init it to be conservative.
+      let pinned_ptr = &raw mut (*h)._pinned;
+      pinned_ptr.write(PhantomPinned);
+      h
+    };
+    Self { heap }
+  }
+
+  fn raw_ptr(&self) -> *mut RawInspectable {
+    self.heap as *mut RawInspectable
+  }
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn v8_inspector__Inspectable__BASE__get(
+  this: *mut RawInspectable,
+  context: Local<Context>,
+) -> *const Value {
+  unsafe {
+    let heap = InspectableHeap::from_raw(this);
+    let scope = pin!(CallbackScope::new(context));
+    let mut scope = scope.init();
+    let result = heap.imp.get(&mut scope, context);
+    &*result
+  }
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn v8_inspector__Inspectable__BASE__DROP(
+  this: *mut RawInspectable,
+) {
+  // V8 destroyed the BASE; reclaim the Rust heap.
+  unsafe {
+    let _ = Box::from_raw(this.cast::<InspectableHeap>());
   }
 }
 
@@ -705,6 +835,130 @@ impl V8InspectorSession {
         detail,
       );
     }
+  }
+
+  /// Mint a RemoteObject for a JS value — the inspector-native counterpart
+  /// of `DOM.resolveNode`. Returns the serialized JSON string ready to be
+  /// slotted into a CDP response (`{ "object": <json> }`). Returns `None`
+  /// when V8's injected script can't wrap the value in the given context
+  /// (e.g. context is gone).
+  pub fn wrap_object<'s>(
+    &self,
+    _scope: &mut PinScope<'s, '_>,
+    context: Local<'s, Context>,
+    value: Local<'s, Value>,
+    group: StringView,
+    generate_preview: bool,
+  ) -> Option<String> {
+    let serializable_ptr = unsafe {
+      v8_inspector__V8InspectorSession__wrapObject(
+        self.raw.as_ptr(),
+        &*context,
+        &*value,
+        group,
+        generate_preview,
+      )
+    };
+    let serializable = Serializable::from_raw(serializable_ptr)?;
+    let cbor = serializable.to_bytes();
+    let json_bytes = cbor_to_json(&cbor)?;
+    String::from_utf8(json_bytes).ok()
+  }
+
+  /// Resolve a RemoteObject ID back to its JS value + owning context —
+  /// the inspector-native counterpart of `DOM.requestNode`. Returns
+  /// `Err(error_message)` on invalid / stale objectId, matching the
+  /// text V8 hands back (e.g. `"Could not find object by remote id"`).
+  pub fn unwrap_object<'s>(
+    &self,
+    _scope: &mut PinScope<'s, '_>,
+    object_id: StringView,
+  ) -> Result<UnwrappedObject<'s>, String> {
+    let mut out_value: *const Value = std::ptr::null();
+    let mut out_context: *const Context = std::ptr::null();
+    let mut out_group: *mut StringBuffer = std::ptr::null_mut();
+    let mut out_error: *mut StringBuffer = std::ptr::null_mut();
+    let ok = unsafe {
+      v8_inspector__V8InspectorSession__unwrapObject(
+        self.raw.as_ptr(),
+        object_id,
+        &mut out_value,
+        &mut out_context,
+        &mut out_group,
+        &mut out_error,
+      )
+    };
+    if !ok {
+      let msg = if out_error.is_null() {
+        String::from("unwrapObject failed")
+      } else {
+        // Take ownership of the error StringBuffer (UniquePtr drops it at
+        // scope end) and stringify.
+        let buf = unsafe { UniquePtr::from_raw(out_error) };
+        buf
+          .as_ref()
+          .map(|r| string_buffer_to_string(r))
+          .unwrap_or_default()
+      };
+      return Err(msg);
+    }
+    // SAFETY: V8 populated these only when `ok == true`. The lifetime is
+    // tied to the caller's scope — the session uses V8's injected script
+    // which owns the Global pinning the Value.
+    let value = unsafe {
+      Local::from_non_null(std::ptr::NonNull::new_unchecked(
+        out_value as *mut Value,
+      ))
+    };
+    let context = unsafe {
+      Local::from_non_null(std::ptr::NonNull::new_unchecked(
+        out_context as *mut Context,
+      ))
+    };
+    let group = if out_group.is_null() {
+      None
+    } else {
+      let buf = unsafe { UniquePtr::from_raw(out_group) };
+      buf.as_ref().map(|r| string_buffer_to_string(r))
+    };
+    Ok(UnwrappedObject {
+      value,
+      context,
+      group,
+    })
+  }
+
+  /// Push a value onto the `$0`/`$1`/`$2` command-line-API stack —
+  /// counterpart of `DOM.setInspectedNode`. V8 takes ownership of the
+  /// `Inspectable`; its `get` callback is invoked lazily each time the
+  /// user references the value.
+  pub fn add_inspected_object(&self, inspectable: Inspectable) {
+    let raw = inspectable.raw_ptr();
+    std::mem::forget(inspectable); // C++ owns; its virtual dtor drops the heap.
+    unsafe {
+      v8_inspector__V8InspectorSession__addInspectedObject(
+        self.raw.as_ptr(),
+        raw,
+      );
+    }
+  }
+}
+
+/// Result of [`V8InspectorSession::unwrap_object`].
+pub struct UnwrappedObject<'s> {
+  pub value: Local<'s, Value>,
+  pub context: Local<'s, Context>,
+  pub group: Option<String>,
+}
+
+fn string_buffer_to_string(buf: &StringBuffer) -> String {
+  let view = buf.string();
+  if let Some(bytes) = view.characters8() {
+    String::from_utf8_lossy(bytes).into_owned()
+  } else if let Some(chunks) = view.characters16() {
+    String::from_utf16_lossy(chunks)
+  } else {
+    String::new()
   }
 }
 

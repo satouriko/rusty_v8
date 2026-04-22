@@ -1,0 +1,116 @@
+name: aimer-build
+
+# Minimal single-target build that produces the artifacts aimer needs
+# to consume this fork locally (via `RUSTY_V8_MIRROR`). Runs on push
+# to `aimer/*` branches and on manual dispatch.
+#
+# Upstream's ci.yml has ~20 matrix entries and only publishes `.a.gz`
+# files on tag builds under `denoland/rusty_v8` — neither fits our
+# workflow. This file triggers on our branches and uploads the two
+# outputs as workflow artifacts, downloadable via
+# `gh run download <run-id>`.
+
+on:
+  push:
+    branches:
+      - 'aimer/**'
+  workflow_dispatch:
+
+jobs:
+  build-linux-release:
+    name: release x86_64-unknown-linux-gnu
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      CARGO_VARIANT_FLAG: --release
+      V8_FROM_SOURCE: true
+      CCACHE: sccache
+      LIB_NAME: rusty_v8
+      LIB_EXT: a
+      FEATURES_SUFFIX: ''
+
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 10
+          submodules: recursive
+
+      - name: Install rust
+        uses: dsherret/rust-toolchain-file@v1
+
+      - name: Install python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.11.x
+          architecture: x64
+
+      - name: Write git_submodule_status.txt
+        run: git submodule status --recursive > git_submodule_status.txt
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |-
+            target/sccache
+            target/*/.*
+            target/*/build
+            target/*/deps
+          key: aimer-cargo1-x86_64-unknown-linux-gnu-release-${{ hashFiles('Cargo.lock', 'build.rs', 'git_submodule_status.txt') }}
+          restore-keys: aimer-cargo1-x86_64-unknown-linux-gnu-release-
+
+      - name: Install and start sccache
+        env:
+          SCCACHE_DIR: ${{ github.workspace }}/target/sccache
+          SCCACHE_CACHE_SIZE: 256M
+          SCCACHE_IDLE_TIMEOUT: 0
+        run: |
+          set -euo pipefail
+          VERSION=v0.8.2
+          BASENAME=sccache-${VERSION}-x86_64-unknown-linux-musl
+          curl -L -o /tmp/${BASENAME}.tar.gz \
+            https://github.com/mozilla/sccache/releases/download/${VERSION}/${BASENAME}.tar.gz
+          tar -C /tmp -xzvf /tmp/${BASENAME}.tar.gz
+          /tmp/${BASENAME}/sccache --start-server
+          echo "/tmp/${BASENAME}" >> "$GITHUB_PATH"
+
+      - name: Install Clang
+        run: |
+          set -euo pipefail
+          echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-19 main" \
+            | sudo dd of=/etc/apt/sources.list.d/llvm-toolchain-jammy-19.list
+          curl https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | gpg --dearmor | sudo dd of=/etc/apt/trusted.gpg.d/llvm-snapshot.gpg
+          sudo apt-get update
+          sudo apt-get -qq remove 'clang-*'
+          sudo apt-get install -y \
+            lld-19 clang-19 clang-tools-19 clang-tidy-19 clang-format-19 libclang-19-dev
+          echo "LIBCLANG_PATH=/usr/lib/llvm-19/lib" >> "$GITHUB_ENV"
+
+      - name: Build
+        env:
+          SCCACHE_IDLE_TIMEOUT: 0
+        run: cargo build -vv --release --locked --target x86_64-unknown-linux-gnu
+
+      - name: Prepare artifacts
+        run: |
+          set -euo pipefail
+          gzip -9c "target/x86_64-unknown-linux-gnu/release/gn_out/obj/${LIB_NAME}.${LIB_EXT}" \
+            > "target/${LIB_NAME}${FEATURES_SUFFIX}_release_x86_64-unknown-linux-gnu.${LIB_EXT}.gz"
+          cp "target/x86_64-unknown-linux-gnu/release/gn_out/src_binding.rs" \
+             "target/src_binding${FEATURES_SUFFIX}_release_x86_64-unknown-linux-gnu.rs"
+          ls -l target/*.gz target/*.rs
+
+      - name: Upload static lib
+        uses: actions/upload-artifact@v4
+        with:
+          name: rusty_v8_release_x86_64-unknown-linux-gnu
+          path: target/rusty_v8_release_x86_64-unknown-linux-gnu.a.gz
+          retention-days: 30
+
+      - name: Upload src_binding
+        uses: actions/upload-artifact@v4
+        with:
+          name: src_binding_release_x86_64-unknown-linux-gnu
+          path: target/src_binding_release_x86_64-unknown-linux-gnu.rs
+          retention-days: 30

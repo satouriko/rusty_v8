@@ -305,6 +305,27 @@ unsafe extern "C" fn v8_inspector__V8InspectorClient__BASE__valueSubtype(
   }
 }
 
+#[unsafe(no_mangle)]
+unsafe extern "C" fn v8_inspector__V8InspectorClient__BASE__descriptionForValueSubtype(
+  this: *mut RawV8InspectorClient,
+  isolate: *mut RealIsolate,
+  context: Local<Context>,
+  value: Local<Value>,
+) -> *mut StringBuffer {
+  // See `valueSubtype` callback above — same scope-building pattern.
+  unsafe {
+    let _ = isolate;
+    let scope = pin!(CallbackScope::new(context));
+    let mut scope = scope.init();
+    V8InspectorClientHeap::from_raw(this)
+      .imp
+      .description_for_value_subtype(&mut scope, value)
+      .and_then(|mut v| v.take())
+      .map(|r| r.into_raw())
+      .unwrap_or(std::ptr::null_mut())
+  }
+}
+
 #[repr(C)]
 #[derive(Debug)]
 struct RawChannel {
@@ -561,7 +582,31 @@ pub trait V8InspectorClientImpl {
   /// management. The C++ shim recovers the isolate + current context
   /// via `v8::Isolate::GetCurrent()` / `GetCurrentContext()` before
   /// dispatching to Rust, then the extern "C" glue builds the scope.
+  ///
+  /// **Must be paired with [`description_for_value_subtype`]** for any
+  /// non-builtin subtype — V8's `clientMirror` only propagates the
+  /// subtype onto the RemoteObject when `descriptionForValueSubtype`
+  /// also returns non-null (see v8/src/inspector/value-mirror.cc).
   fn value_subtype<'s>(
+    &self,
+    scope: &mut PinScope<'s, '_>,
+    value: Local<'s, Value>,
+  ) -> Option<UniquePtr<StringBuffer>> {
+    let _ = scope;
+    let _ = value;
+    None
+  }
+
+  /// Companion hook to [`value_subtype`] — returns the short
+  /// `description` field of `Runtime.RemoteObject` for values whose
+  /// subtype the embedder identified. Must return `Some(...)` whenever
+  /// `value_subtype` returned `Some(...)` for the same value, otherwise
+  /// V8 drops the subtype (see `value-mirror.cc`'s `clientMirror`).
+  ///
+  /// For DOM nodes the description is typically the node's tag name
+  /// (`body`, `div`, ...) — DevTools frontend dresses that up with
+  /// attribute info before rendering.
+  fn description_for_value_subtype<'s>(
     &self,
     scope: &mut PinScope<'s, '_>,
     value: Local<'s, Value>,

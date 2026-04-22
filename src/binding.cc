@@ -3478,6 +3478,10 @@ v8_inspector__V8InspectorClient__BASE__resourceNameToUrl(
 v8_inspector::StringBuffer* v8_inspector__V8InspectorClient__BASE__valueSubtype(
     v8_inspector::V8InspectorClient* self, v8::Isolate* isolate,
     const v8::Context* context, const v8::Value* value);
+v8_inspector::StringBuffer*
+v8_inspector__V8InspectorClient__BASE__descriptionForValueSubtype(
+    v8_inspector::V8InspectorClient* self, v8::Isolate* isolate,
+    const v8::Context* context, const v8::Value* value);
 
 }  // extern "C"
 
@@ -3533,6 +3537,18 @@ struct v8_inspector__V8InspectorClient__BASE
     v8::Local<v8::Context> context = isolate->GetCurrentContext();
     v8_inspector::StringBuffer* b =
         v8_inspector__V8InspectorClient__BASE__valueSubtype(
+            this, isolate, local_to_ptr(context), local_to_ptr(value));
+    return std::unique_ptr<v8_inspector::StringBuffer>(b);
+  }
+  std::unique_ptr<v8_inspector::StringBuffer> descriptionForValueSubtype(
+      v8::Local<v8::Context> context, v8::Local<v8::Value> value) override {
+    // V8 only uses the subtype from valueSubtype() when this returns
+    // non-null (see value-mirror.cc's clientMirror()). Pairing the two
+    // is required for any non-builtin subtype ("node" / etc.) to
+    // actually reach the RemoteObject wire format.
+    v8::Isolate* isolate = v8::Isolate::GetCurrent();
+    v8_inspector::StringBuffer* b =
+        v8_inspector__V8InspectorClient__BASE__descriptionForValueSubtype(
             this, isolate, local_to_ptr(context), local_to_ptr(value));
     return std::unique_ptr<v8_inspector::StringBuffer>(b);
   }

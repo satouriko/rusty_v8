@@ -3475,6 +3475,9 @@ v8_inspector::StringBuffer*
 v8_inspector__V8InspectorClient__BASE__resourceNameToUrl(
     v8_inspector::V8InspectorClient* self,
     const v8_inspector::StringView& resource_name_view);
+v8_inspector::StringBuffer* v8_inspector__V8InspectorClient__BASE__valueSubtype(
+    v8_inspector::V8InspectorClient* self, v8::Isolate* isolate,
+    const v8::Context* context, const v8::Value* value);
 
 }  // extern "C"
 
@@ -3517,6 +3520,20 @@ struct v8_inspector__V8InspectorClient__BASE
     v8_inspector::StringBuffer* b =
         v8_inspector__V8InspectorClient__BASE__resourceNameToUrl(
             this, resource_name_view);
+    return std::unique_ptr<v8_inspector::StringBuffer>(b);
+  }
+  std::unique_ptr<v8_inspector::StringBuffer> valueSubtype(
+      v8::Local<v8::Value> value) override {
+    // Recover the isolate + current context here (V8's valueSubtype
+    // signature doesn't pass them) so the Rust side has everything it
+    // needs to build a typed scope without any further unsafe. The
+    // inspector always calls us with an entered isolate + context, so
+    // these lookups are cheap and well-defined.
+    v8::Isolate* isolate = v8::Isolate::GetCurrent();
+    v8::Local<v8::Context> context = isolate->GetCurrentContext();
+    v8_inspector::StringBuffer* b =
+        v8_inspector__V8InspectorClient__BASE__valueSubtype(
+            this, isolate, local_to_ptr(context), local_to_ptr(value));
     return std::unique_ptr<v8_inspector::StringBuffer>(b);
   }
 };

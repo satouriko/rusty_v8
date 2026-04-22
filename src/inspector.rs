@@ -13,12 +13,16 @@
 //! https://github.com/nodejs/node/tree/v13.7.0/src/inspector
 //! https://github.com/denoland/deno/blob/v0.38.0/cli/inspector.rs
 
+use std::pin::pin;
+
 use crate::Context;
 use crate::Isolate;
 use crate::Local;
+use crate::PinScope;
 use crate::StackTrace;
 use crate::Value;
 use crate::isolate::RealIsolate;
+use crate::scope::CallbackScope;
 use crate::support::CxxVTable;
 use crate::support::Opaque;
 use crate::support::UniquePtr;
@@ -272,6 +276,35 @@ unsafe extern "C" fn v8_inspector__V8InspectorClient__BASE__resourceNameToUrl(
   }
 }
 
+#[unsafe(no_mangle)]
+unsafe extern "C" fn v8_inspector__V8InspectorClient__BASE__valueSubtype(
+  this: *mut RawV8InspectorClient,
+  isolate: *mut RealIsolate,
+  context: Local<Context>,
+  value: Local<Value>,
+) -> *mut StringBuffer {
+  // SAFETY: V8 inspector only invokes this callback on the isolate's
+  // thread with the isolate entered + the context live. Mirrors the
+  // ValueDeserializer::Delegate callback pattern in
+  // `value_deserializer.rs`: all scope construction + unsafe lives
+  // here in the glue, so user `V8InspectorClientImpl::value_subtype`
+  // impls receive a typed `&mut PinScope` and write safe code.
+  unsafe {
+    let _ = isolate; // Kept in signature for symmetry with other callbacks;
+                     // the CallbackScope built from `context` pulls its
+                     // isolate through the Local, no direct need for the
+                     // raw pointer. Drop the silent-unused.
+    let scope = pin!(CallbackScope::new(context));
+    let mut scope = scope.init();
+    V8InspectorClientHeap::from_raw(this)
+      .imp
+      .value_subtype(&mut scope, value)
+      .and_then(|mut v| v.take())
+      .map(|r| r.into_raw())
+      .unwrap_or(std::ptr::null_mut())
+  }
+}
+
 #[repr(C)]
 #[derive(Debug)]
 struct RawChannel {
@@ -513,6 +546,28 @@ pub trait V8InspectorClientImpl {
     &self,
     resource_name: &StringView,
   ) -> Option<UniquePtr<StringBuffer>> {
+    None
+  }
+
+  /// Embedder hook that tells V8 inspector how to tag a value's
+  /// `subtype` field in `Runtime.RemoteObject`. Return `Some("node")`
+  /// for DOM nodes so DevTools renders them as HTML snippets and
+  /// enables reveal-in-Elements. Default: no override (V8 figures out
+  /// the subtype from built-in types like Array / Map / Promise).
+  ///
+  /// `scope` is a `PinScope` rooted at the current context —
+  /// implementations can use it with any scope-taking API (`get_prototype`,
+  /// `Local::new`, etc.) without needing their own unsafe scope
+  /// management. The C++ shim recovers the isolate + current context
+  /// via `v8::Isolate::GetCurrent()` / `GetCurrentContext()` before
+  /// dispatching to Rust, then the extern "C" glue builds the scope.
+  fn value_subtype<'s>(
+    &self,
+    scope: &mut PinScope<'s, '_>,
+    value: Local<'s, Value>,
+  ) -> Option<UniquePtr<StringBuffer>> {
+    let _ = scope;
+    let _ = value;
     None
   }
 }

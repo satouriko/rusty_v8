@@ -113,6 +113,9 @@ unsafe extern "C" {
     group: StringView,
     generate_preview: bool,
   ) -> *mut CppVecU8;
+  fn v8_inspector__Inspectable__BASE__ALLOC(
+    size: usize,
+  ) -> *mut std::ffi::c_void;
   fn v8_inspector__Inspectable__BASE__CONSTRUCT(
     buf: *mut MaybeUninit<RawInspectable>,
   );
@@ -400,26 +403,46 @@ pub trait InspectableImpl {
 }
 
 /// Wraps a `dyn InspectableImpl` in a C++-owned heap suitable for passing
-/// to `V8InspectorSession::add_inspected_object`. The heap is pinned for
-/// the C++ vtable's address-identity requirement; no `Drop` impl on this
-/// type because ownership is ALWAYS transferred to C++ via
-/// `add_inspected_object` (the C++ dtor fires `__DROP` back to reclaim).
+/// to `V8InspectorSession::add_inspected_object`. Allocation and
+/// deallocation both go through the C++ runtime (`::operator new` via
+/// the `__ALLOC` FFI, and `::operator delete` via the unique_ptr V8
+/// holds). No `Drop` impl on this type because ownership is ALWAYS
+/// transferred to C++ via `add_inspected_object` — the C++ dtor fires
+/// `__DROP` back so Rust drops its field in place, then C++ `operator
+/// delete` releases the heap.
 pub struct Inspectable {
   heap: *mut InspectableHeap,
 }
 
+// The default (non-aligned) `::operator new(size_t)` on every C++ impl
+// we target returns memory with at least `__STDCPP_DEFAULT_NEW_ALIGNMENT__`
+// alignment (16 on GCC/Clang x86_64 & aarch64, 8 on MSVC x86). 8 covers
+// `InspectableHeap`'s max field alignment (`Box<dyn Trait>` fat pointer).
+// Compile-time guard so a future field that needs over-aligned storage
+// trips CI instead of UB.
+const _: () = {
+  assert!(
+    std::mem::align_of::<InspectableHeap>() <= 8,
+    "InspectableHeap alignment outgrew `::operator new(size_t)` guarantee; \
+     switch `__ALLOC` to aligned `operator new(size_t, std::align_val_t)`"
+  );
+};
+
 impl Inspectable {
   pub fn new(imp: Box<dyn InspectableImpl>) -> Self {
     let heap = unsafe {
-      let h = Box::into_raw(Box::new(MaybeUninit::<InspectableHeap>::uninit()))
-        .cast::<InspectableHeap>();
+      let h = v8_inspector__Inspectable__BASE__ALLOC(
+        std::mem::size_of::<InspectableHeap>(),
+      )
+      .cast::<InspectableHeap>();
+      assert!(!h.is_null(), "Inspectable allocation failed");
       let raw = &raw mut (*h).raw;
       v8_inspector__Inspectable__BASE__CONSTRUCT(raw.cast());
       let imp_ptr = &raw mut (*h).imp;
       imp_ptr.write(imp);
-      // Zero the `_pinned` marker — `MaybeUninit::uninit` leaves it
-      // undefined, but it's a ZST so reads are meaningless either way;
-      // we still write-init it to be conservative.
+      // Zero the `_pinned` marker — `ALLOC` leaves it undefined, but
+      // it's a ZST so reads are meaningless either way; we still
+      // write-init it to be conservative.
       let pinned_ptr = &raw mut (*h)._pinned;
       pinned_ptr.write(PhantomPinned);
       h
@@ -450,9 +473,22 @@ unsafe extern "C" fn v8_inspector__Inspectable__BASE__get(
 unsafe extern "C" fn v8_inspector__Inspectable__BASE__DROP(
   this: *mut RawInspectable,
 ) {
-  // V8 destroyed the BASE; reclaim the Rust heap.
+  // V8's `~BASE()` fires this mid-destruction. Drop the Rust-side
+  // fields (`imp: Box<dyn InspectableImpl>`, which owns the user-
+  // supplied `InspectableImpl` + any `Global`s it carries) in place
+  // — the backing allocation is owned by C++: `::operator new`
+  // allocated it via `__ALLOC`, `::operator delete` frees it right
+  // after we return (the full `delete this` call is: our `~BASE` →
+  // this DROP → then the compiler-generated `operator delete(this)`).
+  //
+  // `Box::from_raw` here would be wrong on two axes: (a) it deallocs
+  // via Rust's global allocator, which may differ from C++'s
+  // `operator delete` and double-free or leak under
+  // `#[global_allocator]` overrides; (b) even with matched allocators
+  // C++'s `delete this` still frees the same pointer afterwards, so
+  // you'd always double-free.
   unsafe {
-    let _ = Box::from_raw(this.cast::<InspectableHeap>());
+    std::ptr::drop_in_place(this.cast::<InspectableHeap>());
   }
 }
 

@@ -3445,9 +3445,17 @@ bool v8_inspector__V8InspectorSession__unwrapObject(
 // pure-virtual `get(context) -> Local<Value>`. Rust binding mirrors the
 // `V8InspectorClient` BASE pattern: a C++ struct derives from the base,
 // overrides `get` + dtor, forwards each to a Rust `extern "C"` glue fn.
-// Ownership: addInspectedObject takes a unique_ptr, so V8 deletes the BASE
-// instance; our virtual dtor fires a DROP callback so Rust reclaims the
-// InspectableHeap behind the raw pointer.
+//
+// Ownership model (the unusual bit): `addInspectedObject` takes a
+// `unique_ptr<Inspectable>`, so V8 `delete`s the BASE instance. That
+// `delete` hits our virtual dtor (routes to the Rust DROP callback so
+// Rust drops its own fields in place) and then calls `operator delete`
+// to release the memory. To keep alloc + dealloc on the *same*
+// allocator, Rust allocates the heap via the `__ALLOC` FFI below —
+// which calls the C++ `operator new` that pairs with the `operator
+// delete` used at destruction. Going through Rust's Box / global
+// allocator instead would double-free (or leak, depending on the
+// allocator mismatch) on any embedder that swaps `#[global_allocator]`.
 extern "C" {
 const v8::Value* v8_inspector__Inspectable__BASE__get(
     v8_inspector::V8InspectorSession::Inspectable* self,
@@ -3468,6 +3476,17 @@ struct v8_inspector__Inspectable__BASE
 };
 
 extern "C" {
+// Allocate `size` bytes via C++ `operator new`. Rust places both the
+// C++ BASE subobject (via `__CONSTRUCT` below) and its own
+// `InspectableImpl` fields into the returned buffer — the combined
+// size is `sizeof(InspectableHeap)` on the Rust side, which exceeds
+// `sizeof(v8_inspector__Inspectable__BASE)` (just a vtable pointer)
+// but matches what V8 will `operator delete` since the total heap
+// lifetime is bounded by the unique_ptr.
+void* v8_inspector__Inspectable__BASE__ALLOC(size_t size) {
+  return ::operator new(size);
+}
+
 void v8_inspector__Inspectable__BASE__CONSTRUCT(
     uninit_t<v8_inspector__Inspectable__BASE>* buf) {
   construct_in_place<v8_inspector__Inspectable__BASE>(buf);

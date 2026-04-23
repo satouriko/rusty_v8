@@ -1,14 +1,20 @@
 name: aimer-build
 
-# Minimal single-target build that produces the artifacts aimer needs
-# to consume this fork locally (via `RUSTY_V8_MIRROR`). Runs on push
-# to `aimer/*` branches and on manual dispatch.
+# Builds rusty_v8 static libs for every target aimer needs to consume
+# this fork: Linux host + Android {arm64, x86_64}. Runs on push to
+# `aimer/**` branches and on manual dispatch.
 #
-# Upstream's ci.yml has ~20 matrix entries and only publishes `.a.gz`
-# files on tag builds under `denoland/rusty_v8` — neither fits our
-# workflow. This file triggers on our branches and uploads the two
-# outputs as workflow artifacts, downloadable via
-# `gh run download <run-id>`.
+# Upstream denoland ci.yml + release.yml don't ship Android prebuilts.
+# satouriko/rusty-v8-mobile does for main-line V8 versions, but it
+# tracks denoland upstream, so our forked FFI (wrapObject / unwrap /
+# Inspectable / valueSubtype) never lands there. This workflow
+# produces the same set of .a.gz files layered with our FFI, so
+# aimer's Android build can download them via `RUSTY_V8_MIRROR`.
+#
+# Artifacts upload to the workflow run; post-run the caller tags a
+# GitHub release with the binaries so `RUSTY_V8_MIRROR=<release URL>`
+# picks them up. (Artifacts are auth-walled even on public repos;
+# Releases aren't.)
 
 on:
   push:
@@ -16,13 +22,27 @@ on:
       - 'aimer/**'
   workflow_dispatch:
 
+env:
+  # 对齐 satouriko/rusty-v8-mobile：NDK r26c + API 26 跟 aimer 的
+  # `scripts/build-android.sh` + `easel/android/app/build.gradle.kts`
+  # minSdkVersion 保持一致。
+  NDK_VERSION: r26c
+  ANDROID_API_LEVEL: '26'
+
 jobs:
-  build-linux-release:
-    name: release x86_64-unknown-linux-gnu
+  build:
+    name: release ${{ matrix.target }}
     runs-on: ubuntu-22.04
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-linux-android
+          - x86_64-linux-android
+
     env:
-      CARGO_VARIANT_FLAG: --release
       V8_FROM_SOURCE: true
       CCACHE: sccache
       # On Linux the static lib has the `lib` prefix; upstream CI
@@ -41,6 +61,10 @@ jobs:
       - name: Install rust
         uses: dsherret/rust-toolchain-file@v1
 
+      - name: Add Android targets to rust
+        if: contains(matrix.target, 'android')
+        run: rustup target add ${{ matrix.target }}
+
       - name: Install python
         uses: actions/setup-python@v5
         with:
@@ -58,8 +82,8 @@ jobs:
             target/*/.*
             target/*/build
             target/*/deps
-          key: aimer-cargo1-x86_64-unknown-linux-gnu-release-${{ hashFiles('Cargo.lock', 'build.rs', 'git_submodule_status.txt') }}
-          restore-keys: aimer-cargo1-x86_64-unknown-linux-gnu-release-
+          key: aimer-cargo1-${{ matrix.target }}-release-${{ hashFiles('Cargo.lock', 'build.rs', 'git_submodule_status.txt') }}
+          restore-keys: aimer-cargo1-${{ matrix.target }}-release-
 
       - name: Install and start sccache
         env:
@@ -76,7 +100,7 @@ jobs:
           /tmp/${BASENAME}/sccache --start-server
           echo "/tmp/${BASENAME}" >> "$GITHUB_PATH"
 
-      - name: Install Clang
+      - name: Install Clang + ninja
         run: |
           set -euo pipefail
           echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-19 main" \
@@ -86,33 +110,120 @@ jobs:
           sudo apt-get update
           sudo apt-get -qq remove 'clang-*'
           sudo apt-get install -y \
-            lld-19 clang-19 clang-tools-19 clang-tidy-19 clang-format-19 libclang-19-dev
+            lld-19 clang-19 clang-tools-19 clang-tidy-19 clang-format-19 libclang-19-dev ninja-build
           echo "LIBCLANG_PATH=/usr/lib/llvm-19/lib" >> "$GITHUB_ENV"
+
+      # Android: NDK + V8 paths + linker + bindgen env. Ported from
+      # satouriko/rusty-v8-mobile's build.yml (Prepare Android NDK step)
+      # with V8_SRC=$GITHUB_WORKSPACE because our rusty_v8 source IS
+      # this checkout (mobile fork clones v8 separately into rusty_v8-src).
+      - name: Prepare Android NDK
+        if: contains(matrix.target, 'android')
+        run: |
+          set -euo pipefail
+          V8_SRC="$GITHUB_WORKSPACE"
+
+          NDK_CACHE_DIR="/tmp/android-ndk-${NDK_VERSION}"
+          if [ ! -d "$NDK_CACHE_DIR" ]; then
+            curl -L -o /tmp/ndk.zip "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
+            unzip -q -d /tmp /tmp/ndk.zip
+            mv "/tmp/android-ndk-${NDK_VERSION}" "$NDK_CACHE_DIR" 2>/dev/null || true
+            rm /tmp/ndk.zip
+          fi
+
+          NDK_DIR="$V8_SRC/third_party/android_ndk"
+          ln -sfn "$NDK_CACHE_DIR" "$NDK_DIR"
+
+          mkdir -p "$V8_SRC/third_party/android_toolchain"
+          ln -sfn "$NDK_DIR" "$V8_SRC/third_party/android_toolchain/ndk"
+
+          # pydeps stubs — Chromium build/android references these via
+          # GN action() deps; empty placeholders satisfy GN without
+          # pulling in the full test harness.
+          AB="$V8_SRC/build/android"
+          mkdir -p "$AB/pylib/results/presentation" "$AB/test_wrapper"
+          for f in devil_chromium.pydeps apk_operations.pydeps test_runner.pydeps resource_sizes.pydeps; do
+            touch "$AB/$f"
+          done
+          touch "$AB/pylib/results/presentation/test_results_presentation.pydeps"
+          touch "$AB/test_wrapper/logdog_wrapper.pydeps"
+
+          # V8 145+ host rust toolchain asserts `path_exists(sysroot)`
+          # on debian_bullseye_amd64-sysroot; install if missing.
+          SYSROOT_SCRIPT="$V8_SRC/build/linux/sysroot_scripts/install-sysroot.py"
+          if [ -f "$SYSROOT_SCRIPT" ] && [ ! -d "$V8_SRC/build/linux/debian_bullseye_amd64-sysroot" ]; then
+            python3 "$SYSROOT_SCRIPT" --arch=amd64
+          fi
+
+          # V8 140+ needs `build/rust/known-target-triples.txt` (rusty_v8
+          # strips this in their source-trim step; we re-create it).
+          mkdir -p "$V8_SRC/build/rust"
+          cat > "$V8_SRC/build/rust/known-target-triples.txt" << 'TRIPLES'
+          aarch64-linux-android
+          armv7-linux-androideabi
+          x86_64-linux-android
+          i686-linux-android
+          aarch64-apple-ios
+          aarch64-apple-ios-sim
+          x86_64-apple-ios
+          aarch64-unknown-linux-gnu
+          x86_64-unknown-linux-gnu
+          aarch64-apple-darwin
+          x86_64-apple-darwin
+          x86_64-pc-windows-msvc
+          aarch64-pc-windows-msvc
+          TRIPLES
+
+          # Cargo cross-link config — target section has to exactly match
+          # matrix.target so cargo picks up the right linker for rustc's
+          # link step.
+          LINKER="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${ANDROID_API_LEVEL}-clang"
+          if [ "${{ matrix.target }}" = "x86_64-linux-android" ]; then
+            LINKER="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android${ANDROID_API_LEVEL}-clang"
+          fi
+          mkdir -p .cargo
+          cat > .cargo/config.toml << TOML
+          [target.${{ matrix.target }}]
+          linker = "$LINKER"
+          rustflags = ["-C", "link-args=-Wl,--allow-multiple-definition"]
+          TOML
+
+          # bindgen clang args — V8 140+ path (Chromium libc++ needs
+          # Clang 19). Mobile fork has a v130 path too but 147.3.0 is
+          # v140+ so we don't need it.
+          NDK_SYSROOT="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          ARCH_INCLUDE="aarch64-linux-android"
+          if [ "${{ matrix.target }}" = "x86_64-linux-android" ]; then
+            ARCH_INCLUDE="x86_64-linux-android"
+          fi
+          BINDGEN_VAR="BINDGEN_EXTRA_CLANG_ARGS_$(echo '${{ matrix.target }}' | tr '-' '_')"
+          echo "${BINDGEN_VAR}=--sysroot=$NDK_SYSROOT -isystem $V8_SRC/third_party/libc++/src/include -isystem $NDK_SYSROOT/usr/include -isystem $NDK_SYSROOT/usr/include/$ARCH_INCLUDE" >> "$GITHUB_ENV"
 
       - name: Build
         env:
           SCCACHE_IDLE_TIMEOUT: 0
-        run: cargo build -vv --release --locked --target x86_64-unknown-linux-gnu
+          NINJA: /usr/bin/ninja
+        run: cargo build -vv --release --locked --target ${{ matrix.target }}
 
       - name: Prepare artifacts
         run: |
           set -euo pipefail
-          gzip -9c "target/x86_64-unknown-linux-gnu/release/gn_out/obj/${LIB_NAME}.${LIB_EXT}" \
-            > "target/${LIB_NAME}${FEATURES_SUFFIX}_release_x86_64-unknown-linux-gnu.${LIB_EXT}.gz"
-          cp "target/x86_64-unknown-linux-gnu/release/gn_out/src_binding.rs" \
-             "target/src_binding${FEATURES_SUFFIX}_release_x86_64-unknown-linux-gnu.rs"
+          gzip -9c "target/${{ matrix.target }}/release/gn_out/obj/${LIB_NAME}.${LIB_EXT}" \
+            > "target/${LIB_NAME}${FEATURES_SUFFIX}_release_${{ matrix.target }}.${LIB_EXT}.gz"
+          cp "target/${{ matrix.target }}/release/gn_out/src_binding.rs" \
+             "target/src_binding${FEATURES_SUFFIX}_release_${{ matrix.target }}.rs"
           ls -l target/*.gz target/*.rs
 
       - name: Upload static lib
         uses: actions/upload-artifact@v4
         with:
-          name: librusty_v8_release_x86_64-unknown-linux-gnu
-          path: target/librusty_v8_release_x86_64-unknown-linux-gnu.a.gz
+          name: librusty_v8_release_${{ matrix.target }}
+          path: target/librusty_v8_release_${{ matrix.target }}.a.gz
           retention-days: 30
 
       - name: Upload src_binding
         uses: actions/upload-artifact@v4
         with:
-          name: src_binding_release_x86_64-unknown-linux-gnu
-          path: target/src_binding_release_x86_64-unknown-linux-gnu.rs
+          name: src_binding_release_${{ matrix.target }}
+          path: target/src_binding_release_${{ matrix.target }}.rs
           retention-days: 30
